@@ -50,16 +50,17 @@
    :body "OK"})
 
 (defn evaluate-program [uuid s]
-  (when-let [program (get @programs uuid)]
+  (when-let [{program :program} (get @programs uuid)]
     (let [store (store/get-storage-handle {:type :memory})
           json-data (data/stream->triples store s)
           loaded-store (store/assert-data store json-data)
+          axioms (store/resolve-pattern loaded-store '[?e ?p ?v])
           config {:type :memory ; TODO: type from flag+URI (store-type storage)
                   :store loaded-store}
           [store stats] (e/run config program)
-          output (data/store->str store)]
+          output (store/resolve-pattern store '[?e ?p ?v])]
       {:headers json-headers
-       :body output})))
+       :body (json/generate-string (remove (set axioms) output))})))
 
 (defroutes app-routes
   (POST   "/rules" request (post-program (:body request)))
