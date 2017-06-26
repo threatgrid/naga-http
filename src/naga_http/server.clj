@@ -10,6 +10,7 @@
             [naga.rules :as r]
             [naga.storage.memory.core]
             [naga.store :as store]
+            [naga-http.kafka :as kafka]
             [ring.middleware.defaults :refer [wrap-defaults api-defaults]])
   (:import [java.util Date]))
 
@@ -19,8 +20,25 @@
 
 (def programs (atom {}))
 
+(def ^:const default-store {:type :memory})
+
+(def storage (atom default-store))
+
 (defn uuid-str []
   (str (java.util.UUID/randomUUID)))
+
+(defn register-store! [s]
+  (reset! storage s)
+  {:headers plain-headers
+   :body (:type s)})
+
+(defn reset-store! []
+  (reset! programs {})
+  {:headers plain-headers
+   :body "OK"})
+
+(defn registered-store []
+  (or @storage default-store))
 
 (defn parse-program [text]
   (let [{rules :rules} (pabu/read-str text)]
@@ -49,11 +67,28 @@
   {:headers plain-headers
    :body "OK"})
 
+(defn run-program [program store-config]
+  )
+
 (defn evaluate-program [uuid s]
   (when-let [program (get @programs uuid)]
-    (let [store (store/get-storage-handle {:type :memory})
-          json-data (data/stream->triples store s)
-          loaded-store (store/assert-data store json-data)
+    (let [store (store/get-storage-handle (registered-store))
+          triples-data (data/stream->triples store s)
+          loaded-store (store/assert-data store triples-data)
+          config {:type :memory ; TODO: type from flag+URI (store-type storage)
+                  :store loaded-store}
+          [store stats] (e/run config program)
+          output (data/store->str store)]
+      {:headers json-headers
+       :body output})))
+
+(defn exec-program [uuid program store-config]
+  (when-let [program (or program (get @programs uuid))]
+    (let [
+          s-cfg (or store-config (registered-store))
+          store (store/get-storage-handle s-cfg)
+          triples-data (data/stream->triples store s)
+          loaded-store (store/assert-data store triples-data)
           config {:type :memory ; TODO: type from flag+URI (store-type storage)
                   :store loaded-store}
           [store stats] (e/run config program)
@@ -62,13 +97,23 @@
        :body output})))
 
 (defroutes app-routes
+  (POST   "/store" request (register-store! (:body request)))
+  (DELETE "/store" request (reset-store!))
   (POST   "/rules" request (post-program (:body request)))
   (DELETE "/rules" request (delete-programs))
   (GET    "/rules/:uuid" [uuid] (get-program uuid))
   (POST   "/rules/:uuid/eval" [uuid :as request] (evaluate-program uuid (:body request)))
+  (POST   "/rules/:uuid/execute" [uuid :as {:body {:keys [program store]}}]
+          (exec-program uuid program store))
   (route/not-found "Not Found"))
 
 (def app
   (wrap-defaults
    app-routes
    (assoc-in api-defaults [:params :multipart] true)))
+
+(defn init
+  "Initialize the server for non-HTTP operations."
+  []
+  (kafka/init)
+  (kafka/register-graph @storage))

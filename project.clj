@@ -1,7 +1,8 @@
 (defproject naga-http "0.1.0-SNAPSHOT"
   :min-lein-version "2.0.0"
   :dependencies [[org.clojure/clojure "1.8.0"]
-                 [naga "0.1.0-SNAPSHOT"]
+                 [org.clojars.quoll/naga "0.1.0"]
+                 [ymilky/franzy "0.0.1"]
                  [compojure "1.5.2"]
                  [ring/ring-defaults "0.2.1"]]
   :plugins [[lein-ring "0.9.7"]]
