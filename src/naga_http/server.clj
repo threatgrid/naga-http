@@ -20,7 +20,9 @@
 
 (def programs (atom {}))
 
-(def ^:const default-store {:type :memory})
+(def ^:const default-graph (store/get-storage-handle {:type :memory}))
+
+(def ^:const default-store {:type :memory :store default-graph})
 
 (def storage (atom default-store))
 
@@ -28,16 +30,23 @@
   (str (java.util.UUID/randomUUID)))
 
 (defn register-store! [s]
-  (reset! storage s)
+  (let [g (store/get-storage-handle s)]
+    (reset! storage (assoc s :store g))
+    (kafka/register-graph g))
   {:headers plain-headers
    :body (:type s)})
 
 (defn reset-store! []
-  (reset! programs {})
+  (reset! storage default-store)
+  (kafka/register-graph (:store default-store))
   {:headers plain-headers
    :body "OK"})
 
-(defn registered-store []
+(defn update-store! [s]
+  (swap! storage assoc :store s)
+  (kafka/register-graph s))
+
+(defn registered-storage []
   (or @storage default-store))
 
 (defn parse-program [text]
@@ -67,32 +76,33 @@
   {:headers plain-headers
    :body "OK"})
 
-(defn run-program [program store-config]
-  )
-
-(defn evaluate-program [uuid s]
-  (when-let [program (get @programs uuid)]
-    (let [store (store/get-storage-handle (registered-store))
-          triples-data (data/stream->triples store s)
+(defn execute-program [program store data]
+  (when program
+    (let [triples-data (when data (data/stream->triples store data))
           loaded-store (store/assert-data store triples-data)
-          config {:type :memory ; TODO: type from flag+URI (store-type storage)
-                  :store loaded-store}
+          config (assoc storage :store loaded-store)
           [store stats] (e/run config program)
           output (data/store->str store)]
+      [output store])))
+
+(defn exec-registered [uuid s]
+  (when-let [program (get @programs uuid)]
+    (let [storage (registered-storage)
+          store (or (:store storage)
+                    (store/get-storage-handle storage))
+          [output new-store] (execute-program program store s)]
+      (update-store! new-store)
       {:headers json-headers
        :body output})))
 
-(defn exec-program [uuid program store-config]
+(defn exec-program [uuid program storage-config]
   (when-let [program (or program (get @programs uuid))]
-    (let [
-          s-cfg (or store-config (registered-store))
-          store (store/get-storage-handle s-cfg)
-          triples-data (data/stream->triples store s)
-          loaded-store (store/assert-data store triples-data)
-          config {:type :memory ; TODO: type from flag+URI (store-type storage)
-                  :store loaded-store}
-          [store stats] (e/run config program)
-          output (data/store->str store)]
+    (let [storage (or storage-config (registered-storage))
+          store (or (:store storage)
+                    (store/get-storage-handle storage))
+          [output new-store] (execute-program program store nil)]
+      (when-not storage-config
+        (update-store! new-store))
       {:headers json-headers
        :body output})))
 
@@ -102,8 +112,8 @@
   (POST   "/rules" request (post-program (:body request)))
   (DELETE "/rules" request (delete-programs))
   (GET    "/rules/:uuid" [uuid] (get-program uuid))
-  (POST   "/rules/:uuid/eval" [uuid :as request] (evaluate-program uuid (:body request)))
-  (POST   "/rules/:uuid/execute" [uuid :as {:body {:keys [program store]}}]
+  (POST   "/rules/:uuid/eval" [uuid :as request] (exec-registered uuid (:body request)))
+  (POST   "/rules/:uuid/execute" [uuid :as {{:keys [program store]} :body}]
           (exec-program uuid program store))
   (route/not-found "Not Found"))
 

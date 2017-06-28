@@ -18,7 +18,7 @@
 
 (def poll-timeout 100)
 
-(def graphs (atom []))
+(def graph (atom nil))
 
 (def shutdown? (promise))
 
@@ -34,11 +34,10 @@
 (defn load-data
   "Loads a string (containing JSON) into a graph."
   [text]
-  (reset! graphs
-    (map (fn [g]
+  (swap! graph
+         (fn [g]
            (let [graph-data (naga-data/string->triples g text)]
-             (naga-store/assert-data g graph-data)))
-         @graphs)))
+             (naga-store/assert-data g graph-data)))))
 
 (defn init
   "Initialize the Kafka listener"
@@ -69,6 +68,6 @@
 
 (defn register-graph
   "Registers this graph to have kafka events loaded into it"
-  [graph]
-  (swap! graphs conj graph))
+  [g]
+  (reset! graph g))
 
