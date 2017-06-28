@@ -1,7 +1,8 @@
 (ns ^{:doc "Defines a ring handler that exposes the Naga rule engine as a web service."
       :author "Jesse Bouwman"}
     naga-http.server
-  (:require [cheshire.core :as json]
+  (:require [clojure.tools.logging :as log]
+            [cheshire.core :as json]
             [compojure.core :refer :all]
             [compojure.route :as route]
             [naga.data :as data]
@@ -10,6 +11,7 @@
             [naga.rules :as r]
             [naga.storage.memory.core]
             [naga.store :as store]
+            [naga-http.configuration :as c]
             [naga-http.kafka :as kafka]
             [ring.middleware.defaults :refer [wrap-defaults api-defaults]])
   (:import [java.util Date]))
@@ -31,20 +33,17 @@
 
 (defn register-store! [s]
   (let [g (store/get-storage-handle s)]
-    (reset! storage (assoc s :store g))
-    (kafka/register-graph g))
+    (reset! storage (assoc s :store g)))
   {:headers plain-headers
    :body (:type s)})
 
 (defn reset-store! []
   (reset! storage default-store)
-  (kafka/register-graph (:store default-store))
   {:headers plain-headers
    :body "OK"})
 
 (defn update-store! [s]
-  (swap! storage assoc :store s)
-  (kafka/register-graph s))
+  (swap! storage assoc :store s))
 
 (defn registered-storage []
   (or @storage default-store))
@@ -107,6 +106,7 @@
        :body output})))
 
 (defroutes app-routes
+  ;; TODO: post data to graph
   (POST   "/store" request (register-store! (:body request)))
   (DELETE "/store" request (reset-store!))
   (POST   "/rules" request (post-program (:body request)))
@@ -125,5 +125,9 @@
 (defn init
   "Initialize the server for non-HTTP operations."
   []
-  (kafka/init)
-  (kafka/register-graph @storage))
+  (c/init!)
+  (kafka/init (get-in @c/properties [:http-naga :kafka :topic]))
+  (kafka/register-storage storage))
+
+;; TODO: main, starting a web server
+(init)
