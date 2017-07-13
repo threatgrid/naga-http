@@ -4,12 +4,17 @@
   naga-http.kafka
   (:require [naga-http.configuration :as c]
             [clojure.tools.logging :as log]
+            [cheshire.core :as json]
             [franzy.clients.consumer.client :as consumer]
             [franzy.clients.consumer.protocols :as protocols]
             [franzy.clients.consumer.defaults :as cd]
             [franzy.serialization.deserializers :as deserializers]
             [naga.data :as naga-data]
             [naga.store :as naga-store]))
+
+(def ^:const default-max-errors 20)
+
+(def ^:const default-poll-timeout 100)
 
 (defn get-servers
   []
@@ -38,10 +43,19 @@
 (defn load-data
   "Loads a string (containing JSON) into a graph and updates the server storage to use this graph."
   [text]
-  (letfn [(store-update [{g :store :as storage}]
-            (let [graph-data (naga-data/string->triples g text)
-                  new-graph (naga-store/assert-data g graph-data)]
-              (assoc storage :store new-graph)))]
+  (letfn [(store-update [{s :store :as storage}]
+            (let [{:keys [entity] :as json-data} (json/parse-string text true)]
+              (if entity
+                (let [_ (println "ENTITY: " entity)
+                      _ (println "OLD GRAPH: " s)
+                      graph-data (naga-data/json->triples s [entity])
+                      new-graph (naga-store/assert-data s graph-data)]
+                  (println "NEW GRAPH: " new-graph)
+                  (assoc storage :store new-graph))
+                (do
+                  (println "Unexpected data for topic: " text)
+                  (log/info "Unexpected data for topic: " text)
+                  storage))))]
     (try
       ;; Dereferencing to get the atom in the server
       (swap! @storage-atom store-update)
@@ -53,10 +67,11 @@
   [topic]
   (log/debug "Initializing Kafka")
   (do-at-shutdown (deliver shutdown? true))
-  (let [topic (or topic (get-in @c/properties [:naga-http :kafka :topic]))
+  (let [topic (get-in @c/properties [:naga-http :kafka :topic] topic)
         pc {:bootstrap.servers (get-servers)
             :auto.offset.reset :latest}
-        poll-timeout (get-in @c/properties [:naga-http :kafka :poll])
+        poll-timeout (get-in @c/properties [:naga-http :kafka :poll] default-poll-timeout)
+        max-errors (get-in @c/properties [:naga-http :kafka :max-errors] default-max-errors)
         key-deserializer (deserializers/string-deserializer)
         value-deserializer (deserializers/string-deserializer)
         opts (cd/make-default-consumer-options)
@@ -67,18 +82,25 @@
       (protocols/seek-to-beginning-offset! c topic-partitions)
       (log/debug "Initializing Kafka service")
       (start-service
-        (fn []
-          (log/debug "Listening to Kafka topic")
-          (try
-            (loop [cr (protocols/poll! c poll-timeout)]
-              (log/debug "poll returned")
-              (when-not (realized? shutdown?)
-                (log/debug "Kafka message")
-                (doseq [{v :value} (protocols/records-by-topic cr topic)]
-                  (log/info v)
-                  (load-data v))
-                (recur (protocols/poll! c poll-timeout))))
-            (finally (.close c)))))
+       (fn []
+         (log/debug "Listening to Kafka topic")
+         (try
+           (loop [err-count 0]
+             (let [errs (try
+                          (let [cr (protocols/poll! c poll-timeout)]
+                            (when-not (realized? shutdown?)
+                              (log/debug "Kafka message")
+                              (doseq [{v :value} (protocols/records-by-topic cr topic)]
+                                (log/info v)
+                                (load-data v))
+                              err-count))
+                          (catch Exception e
+                            (log/error "Exception in Kafka: " e)
+                            (if (< err-count max-errors)
+                              (inc err-count)
+                              (log/error "Kafka service exceeded maximum errors. Exiting."))))]
+               (when errs (recur errs))))
+           (finally (.close c)))))
       ;; if something went wrong starting the thread, then clean up
       (catch Exception e
         (log/error "Error while setting up Kafka" e)
