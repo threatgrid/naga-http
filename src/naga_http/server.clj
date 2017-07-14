@@ -43,8 +43,6 @@
   `(try
      (let [response# (or (do ~@body)
                          "OK")]
-       (pprint "RESPONDING: ")
-       (clojure.pprint/pprint response#)
        (cond
          (map? response#)
          (if (:headers response#)
@@ -65,6 +63,7 @@
                         :body (.getMessage ei#)}]
          (assoc response# :status (or status# 500))))
      (catch Exception e#
+       (.printStackTrace e#)
        {:headers plain-headers
         :status 500
         :body (.getMessage e#)})))
@@ -86,10 +85,12 @@
 
 (defn reset-store! []
   (http-response
-   (reset! storage default-store)))
+   (reset! storage default-store)
+   default-store))
 
 (defn update-store! [s]
-  (swap! storage assoc :store s))
+  (swap! storage assoc :store s)
+  s)
 
 (defn registered-storage []
   (or @storage default-store))
@@ -141,11 +142,14 @@
     (store/assert-schema-opts store (or schema (slurp raw-data)) {:type dtype})
     "OK"))
 
-(defn add-data [{triples :triples :as data}]
+(defn add-data [data]
   (http-response
-   (-> (registered-store)
-       (store/assert-data triples)
-       update-store!)))
+   (let [store (registered-store)
+         triples (data/json->triples store data)]
+     (-> store
+         (store/assert-data triples)
+         update-store!)
+     "OK")))
 
 (defn read-data
   "Reads data from a store. Takes optional query arguments, or a flag indicating raw results.
@@ -189,18 +193,28 @@
        {:headers json-headers
         :body output}))))
 
+(defn test-post
+  [data]
+  (let [d (slurp data)]
+    (print "POSTED: ")
+    (clojure.pprint/pprint d)))
+
 (defroutes app-routes
-  (POST   "/store" request (register-store! (:body request)))
+  (POST   "/store" [:as {dbconfig :body-params}] (register-store! dbconfig))
   (DELETE "/store" request (reset-store!))
+  (POST "/store/test" [:as {raw :body}]
+        (test-post raw))
   (POST   "/store/schema" [:as {headers :headers schema :body-params raw-data :body}]
           (add-schema headers schema raw-data))
-  (GET    "/store/data" [:as {body :body}] (read-data body))
-  (POST   "/store/data" [:as {body :body}] (add-data body))
+  (GET    "/store/data" [:as {params :params :as request}]
+          ;; TODO get header params
+          (read-data params))
+  (POST   "/store/data" [:as {data :body-params}] (add-data data))
   (POST   "/rules" [:as {body :body}] (post-program body))
   (DELETE "/rules" request (delete-programs))
   (GET    "/rules/:uuid" [uuid] (get-program uuid))
   (POST   "/rules/:uuid/eval" [uuid :as {body :body}] (exec-registered uuid body))
-  (POST   "/rules/:uuid/execute" [uuid :as {{:keys [program store]} :body}]
+  (POST   "/rules/:uuid/execute" [uuid :as {{:keys [program store]} :body-params}]
           (exec-program uuid program store))
   (route/not-found "Not Found"))
 
