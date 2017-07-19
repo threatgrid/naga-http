@@ -17,6 +17,7 @@
             [naga-http.kafka :as kafka]
             [ring.adapter.jetty :as jetty]
             [ring.middleware.defaults :refer [wrap-defaults api-defaults]]
+            [ring.middleware.params :refer [wrap-params]]
             [ring.middleware.format :refer [wrap-restful-format]])
   (:import [java.util Date]
            [java.net BindException]
@@ -156,7 +157,7 @@
    Queries return raw data. If no query is specified, then return everything.
    If returning everything, then setting raw will return the triples directly from the graph
    store. Otherwise a JSON representation is returned."
-  [{:keys [select where raw] :as query}]
+  [{:strs [select where raw] :as query}]
   (http-response
    (let [store (registered-store)]
      (if select
@@ -219,8 +220,9 @@
   (route/not-found "Not Found"))
 
 (def app
-  (wrap-restful-format app-routes
-                       :formats [:json-kw :edn]))
+  (-> app-routes
+      (wrap-restful-format :formats [:json-kw :edn])
+      (wrap-params)))
 
 (let [initialized? (promise)]
   (defn init
