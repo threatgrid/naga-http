@@ -46,7 +46,7 @@
   (letfn [(store-update [{s :store :as storage}]
             (let [{:keys [entity] :as json-data} (json/parse-string text true)]
               (if entity
-                (let [ graph-data (naga-data/json->triples s [entity])
+                (let [graph-data (naga-data/json->triples s [entity])
                       new-graph (naga-store/assert-data s graph-data)]
                   (assoc storage :store new-graph))
                 (do
