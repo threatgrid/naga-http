@@ -21,7 +21,8 @@
                        "naga-http.kafka.max-errors" s/Int
                        "naga-http.kafka.poll" s/Int})
   
-    (st/optional-keys {"naga-http.naga.graph" s/Str})))
+    (st/optional-keys {"naga-http.naga.graph" s/Str
+                       "naga-http.port" s/Int})))
 
 (def configurable-properties (mls/keys PropertiesSchema))
 

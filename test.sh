@@ -2,7 +2,7 @@
 
 set -e
 
-server=http://localhost:3000
+server=http://localhost:3030
 scratch=target/test
 
 rules_in=../naga/data/family.lg
