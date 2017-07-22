@@ -46,14 +46,10 @@
   (letfn [(store-update [{s :store :as storage}]
             (let [{:keys [entity] :as json-data} (json/parse-string text true)]
               (if entity
-                (let [_ (println "ENTITY: " entity)
-                      _ (println "OLD GRAPH: " s)
-                      graph-data (naga-data/json->triples s [entity])
+                (let [ graph-data (naga-data/json->triples s [entity])
                       new-graph (naga-store/assert-data s graph-data)]
-                  (println "NEW GRAPH: " new-graph)
                   (assoc storage :store new-graph))
                 (do
-                  (println "Unexpected data for topic: " text)
                   (log/info "Unexpected data for topic: " text)
                   storage))))]
     (try
