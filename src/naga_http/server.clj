@@ -29,7 +29,7 @@
 
 (def default-max-threads 50)
 
-(def default-http-port 3000)
+(def default-http-port 3030)
 
 (def programs (atom {}))
 
@@ -104,16 +104,18 @@
          (store/get-storage-handle storage)))))
 
 (defn parse-program [text]
-  (let [{rules :rules} (pabu/read-str text)]
-    (r/create-program rules [])))
+  (let [{:keys [rules axioms]} (pabu/read-str text)]
+    [(r/create-program rules []) axioms]))
 
 (defn install-program! [s]
   (let [uuid (uuid-str)
-        text (slurp s)]
+        text (slurp s)
+        [program axioms] (parse-program text)]
     (swap! programs assoc uuid
            {:created (Date.)
             :text text
-            :program (parse-program text)})
+            :program program
+            :axioms axioms})
     uuid))
 
 (defn post-program [s]
@@ -166,29 +168,35 @@
          (store/retrieve-contents store)
          (data/store->json store))))))
 
-(defn execute-program [program store data]
+(defn execute-program [program axioms store data]
   (when program
-    (let [triples-data (when data (data/stream->triples store data))
-          loaded-store (store/assert-data store triples-data)
-          config (assoc storage :store loaded-store)
+    (let [initialized-store (if (seq axioms) (store/assert-data store axioms) store)
+          triples-data (when data (data/stream->triples initialized-store data))
+          loaded-store (if (seq triples-data)
+                         (store/assert-data initialized-store triples-data)
+                         initialized-store)
+          config (assoc @storage :store loaded-store)
           [store stats] (e/run config program)
           output (data/store->str store)]
       [output store])))
 
 (defn exec-registered [uuid s]
   (http-response
-   (when-let [program (get @programs uuid)]
+   (when-let [{:keys [program axioms]} (get @programs uuid)]
      (let [store (registered-store)
-           [output new-store] (execute-program program store s)]
+           [output new-store] (execute-program program axioms store s)]
        (update-store! new-store)
        {:headers json-headers
         :body output}))))
 
-(defn exec-program [uuid program storage-config]
+(defn exec-program [uuid program-text storage-config]
   (http-response
-   (when-let [program (or program (get @programs uuid))]
+   (let [[program axioms] (if program-text
+                           (parse-program program-text)
+                           (let [{:keys [program axioms]} (get @programs uuid)]
+                             [program axioms]))]
      (let [store (registered-store storage-config)
-           [output new-store] (execute-program program store nil)]
+           [output new-store] (execute-program program axioms store nil)]
        (when-not storage-config
          (update-store! new-store))
        {:headers json-headers
