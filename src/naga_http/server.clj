@@ -78,7 +78,7 @@
 (defn uuid-str []
   (str (java.util.UUID/randomUUID)))
 
-(defn register-store! [s]
+(defn set-store! [s]
   (http-response
    (let [g (store/get-storage-handle s)]
      (reset! storage (assoc s :store g))
@@ -93,21 +93,26 @@
   (swap! storage assoc :store s)
   s)
 
-(defn registered-storage []
+(defn registered-storage
+  "Storage wraps a store with extra metadata"
+  []
   (or @storage default-store))
 
 (defn registered-store
+  "The connection to the implementation of the Graph protocol"
   ([] (registered-store nil))
   ([storage-config]
    (let [storage (or storage-config (registered-storage))]
      (or (:store storage)
          (store/get-storage-handle storage)))))
 
-(defn parse-program [text]
+(defn parse-program
+  [text]
   (let [{:keys [rules axioms]} (pabu/read-str text)]
     [(r/create-program rules []) axioms]))
 
-(defn install-program! [s]
+(defn install-program!
+  [s]
   (let [uuid (uuid-str)
         text (slurp s)
         [program axioms] (parse-program text)]
@@ -140,10 +145,12 @@
 
 (defn add-schema
   [header schema raw-data]
-  (let [dtype (get-data-type header)
-        store (registered-store)]
-    (store/assert-schema-opts store (or schema (slurp raw-data)) {:type dtype})
-    "OK"))
+  (http-response
+   (let [dtype (get-data-type header)]
+     (-> (registered-store)
+         (store/assert-schema-opts (or schema (slurp raw-data)) {:type dtype})
+         update-store!)
+     "OK")))
 
 (defn add-data [data]
   (http-response
@@ -182,12 +189,13 @@
 
 (defn exec-registered [uuid s]
   (http-response
-   (when-let [{:keys [program axioms]} (get @programs uuid)]
+   (if-let [{:keys [program axioms]} (get @programs uuid)]
      (let [store (registered-store)
            [output new-store] (execute-program program axioms store s)]
        (update-store! new-store)
        {:headers json-headers
-        :body output}))))
+        :body output})
+     {:status 404 :body (str "Program " uuid " not found")})))
 
 (defn exec-program [uuid program-text storage-config]
   (http-response
@@ -209,16 +217,19 @@
     (clojure.pprint/pprint d)))
 
 (defroutes app-routes
-  (POST   "/store" [:as {dbconfig :body-params}] (register-store! dbconfig))
+  (POST   "/store" [:as {dbconfig :body-params}] (set-store! dbconfig))
   (DELETE "/store" request (reset-store!))
-  (POST "/store/test" [:as {raw :body}]
-        (test-post raw))
+
   (POST   "/store/schema" [:as {headers :headers schema :body-params raw-data :body}]
           (add-schema headers schema raw-data))
-  (GET    "/store/data" [:as {params :params :as request}]
-          ;; TODO get header params
-          (read-data params))
+
   (POST   "/store/data" [:as {data :body-params}] (add-data data))
+  (GET    "/store/data" [:as {params :params :as request}]
+          (read-data params))
+
+  (POST "/store/test" [:as {raw :body}]
+        (test-post raw))
+
   (POST   "/rules" [:as {body :body}] (post-program body))
   (DELETE "/rules" request (delete-programs))
   (GET    "/rules/:uuid" [uuid] (get-program uuid))
@@ -243,7 +254,7 @@
         (clojure.pprint/pprint @c/properties)
         (setup-storage! graph)
         (kafka/init topic)
-        (kafka/register-storage storage))
+        (kafka/set-storage storage))
       (deliver initialized? true))))
 
 ;; This is here so initialization happens with: lein ring server
