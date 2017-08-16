@@ -21,14 +21,6 @@
   (let [{:keys [host port]} (get-in @c/properties [:naga-http :kafka])]
     (str host ":" port)))
 
-;; A write-once atom referencing an atom
-(def storage-atom (atom nil))
-
-(defn register-storage
-  "Registers the atom to load data into. This avoids referencing the server atom."
-  [s]
-  (reset! storage-atom s))
-
 (def shutdown? (promise))
 
 (defn start-service
@@ -42,7 +34,7 @@
 
 (defn load-data
   "Loads a string (containing JSON) into a graph and updates the server storage to use this graph."
-  [text]
+  [storage-atom text]
   (letfn [(store-update [{s :store :as storage}]
             (let [{:keys [entity] :as json-data} (json/parse-string text true)]
               (if entity
@@ -54,18 +46,24 @@
                   storage))))]
     (try
       ;; Dereferencing to get the atom in the server
-      (swap! @storage-atom store-update)
+      (swap! storage-atom store-update)
       (catch Exception e
         (log/error "Error processing data from Kafka" e)))))
 
 (defn init
   "Initialize the Kafka listener"
-  [topic]
+  [storage]
   (log/debug "Initializing Kafka")
   (do-at-shutdown (deliver shutdown? true))
-  (let [topic (get-in @c/properties [:naga-http :kafka :topic] topic)
-        pc {:bootstrap.servers (get-servers)
-            :auto.offset.reset :latest}
+  (let [{:keys [topic partition security truststore keystore password]}
+        (get-in @c/properties [:naga-http :kafka])
+
+        pc (cond-> {:bootstrap.servers (get-servers)
+                    :auto.offset.reset :latest}
+             security (assoc :security.protocol (str/upper-case security))
+             truststore (assoc :ssl.truststore.location truststore)
+             keystore (assoc :ssl.keystore.location keystore)
+             password (assoc :ssl.truststore.password password))
         poll-timeout (get-in @c/properties [:naga-http :kafka :poll] default-poll-timeout)
         max-errors (get-in @c/properties [:naga-http :kafka :max-errors] default-max-errors)
         key-deserializer (deserializers/string-deserializer)
@@ -88,8 +86,10 @@
                               (log/debug "Kafka message")
                               (doseq [{v :value} (protocols/records-by-topic cr topic)]
                                 (log/info v)
-                                (load-data v))
+                                (load-data storage v))
                               err-count))
+                          ;; TODO: treat local exceptions as retryable/fatal
+                          ;;       and protocol exceptions as retryable with long delay
                           (catch Exception e
                             (log/error "Exception in Kafka: " e)
                             (if (< err-count max-errors)

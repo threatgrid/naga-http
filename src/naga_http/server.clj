@@ -3,6 +3,7 @@
     naga-http.server
   (:require [clojure.tools.logging :as log]
             [clojure.string :as s]
+            [clojure.edn :as edn]
             [cheshire.core :as json]
             [compojure.core :refer :all]
             [compojure.route :as route]
@@ -170,7 +171,7 @@
   (http-response
    (let [store (registered-store)]
      (if select
-       (store/query store select where)
+       (store/query store (edn/read-string select) (edn/read-string where))
        (if raw
          (store/retrieve-contents store)
          (data/store->json store))))))
@@ -249,12 +250,10 @@
     []
     (when-not (realized? initialized?)
       (c/init!)
-      (let [{{{graph :graph} :naga
-              {topic :topic} :kafka} :naga-http :as properties} @c/properties]
+      (let [{{{graph :graph} :naga} :naga-http :as properties} @c/properties]
         (clojure.pprint/pprint @c/properties)
         (setup-storage! graph)
-        (kafka/init topic)
-        (kafka/set-storage storage))
+        (kafka/init storage))
       (deliver initialized? true))))
 
 ;; This is here so initialization happens with: lein ring server
