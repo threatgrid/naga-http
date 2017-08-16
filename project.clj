@@ -1,7 +1,7 @@
 (defproject naga-http "0.1.0-SNAPSHOT"
   :min-lein-version "2.0.0"
   :dependencies [[org.clojure/clojure "1.8.0"]
-                 [org.clojars.quoll/naga-dp "0.2.1"]
+                 [org.clojars.quoll/naga-dp "0.2.2-SNAPSHOT"]
                  [org.clojure/tools.logging "0.4.0"]
                  [log4j "1.2.17"]
                  [threatgrid/clj-momo "0.2.9"]
