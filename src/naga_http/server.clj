@@ -4,6 +4,7 @@
   (:require [clojure.tools.logging :as log]
             [clojure.string :as s]
             [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [cheshire.core :as json]
             [compojure.core :refer :all]
             [compojure.route :as route]
@@ -40,6 +41,18 @@
 
 (def storage (atom default-store))
 
+(defn get-core-schema
+  "Retrieves the configured schema for storage, or an empty seq otherwise.
+   Throws an exception if a non-existent file is specified."
+  []
+  (when-let [{{{schema :schema} :naga} :naga-http :as properties} @c/properties]
+    (try
+      (if-let [r (io/resource schema)]
+        (slurp r)
+        (slurp schema))
+      (catch IllegalArgumentException e
+        (throw (ex-info "Unable to open schema file: " schema {:file schema}))))))
+
 (defmacro http-response
   [& body]
   `(try
@@ -70,19 +83,24 @@
         :status 500
         :body (.getMessage e#)})))
 
+(defn init-storage!
+  [s g]
+  (let [schema (get-core-schema)
+        schemaed-g (if schema
+                     (store/assert-schema-opts g schema {:type :pairs})
+                     g)]
+    (reset! storage (assoc s :store schemaed-g))))
+
 (defn setup-storage! [stext]
   (when stext
     (let [st (json/parse-string stext true)
           handle (store/get-storage-handle st)]
-      (reset! storage (assoc st :store handle)))))
-
-(defn uuid-str []
-  (str (java.util.UUID/randomUUID)))
+      (init-storage! st handle))))
 
 (defn set-store! [s]
   (http-response
    (let [g (store/get-storage-handle s)]
-     (reset! storage (assoc s :store g))
+     (init-storage! s g)
      (:type s))))
 
 (defn reset-store! []
@@ -106,6 +124,9 @@
    (let [storage (or storage-config (registered-storage))]
      (or (:store storage)
          (store/get-storage-handle storage)))))
+
+(defn uuid-str []
+  (str (java.util.UUID/randomUUID)))
 
 (defn parse-program
   [text]

@@ -22,6 +22,7 @@
                        "naga-http.kafka.poll" s/Int})
   
     (st/optional-keys {"naga-http.naga.graph" s/Str
+                       "naga-http.naga.schema" s/Str
                        "naga-http.port" s/Int})))
 
 (def configurable-properties (mls/keys PropertiesSchema))

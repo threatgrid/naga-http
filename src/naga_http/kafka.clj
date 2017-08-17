@@ -3,6 +3,7 @@
       :author "Paula Gearon"}
   naga-http.kafka
   (:require [naga-http.configuration :as c]
+            [clojure.string :as str]
             [clojure.tools.logging :as log]
             [cheshire.core :as json]
             [franzy.clients.consumer.client :as consumer]
