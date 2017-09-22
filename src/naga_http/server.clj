@@ -17,6 +17,7 @@
             [naga.store :as store]
             [naga-http.configuration :as c]
             [naga-http.kafka :as kafka]
+            [naga-http.publish :as p]
             [ring.adapter.jetty :as jetty]
             [ring.middleware.defaults :refer [wrap-defaults api-defaults]]
             [ring.middleware.params :refer [wrap-params]]
@@ -197,7 +198,7 @@
          (store/retrieve-contents store)
          (data/store->json store))))))
 
-(defn execute-program [program axioms store data]
+(defn execute-program [program axioms store data publisher]
   (when program
     (let [initialized-store (if (seq axioms) (store/assert-data store axioms) store)
           triples-data (when data (data/stream->triples initialized-store data))
@@ -205,28 +206,30 @@
                          (store/assert-data initialized-store triples-data)
                          initialized-store)
           config (assoc @storage :store loaded-store)
-          [store stats] (e/run config program)
+          [store stats delta-ids] (e/run config program)
+          deltas (map (partial data/id->json store) delta-ids)
           output (data/store->str store)]
+      (p/publish publisher deltas)
       [output store])))
 
-(defn exec-registered [uuid s]
+(defn exec-registered [uuid s publisher]
   (http-response
    (if-let [{:keys [program axioms]} (get @programs uuid)]
      (let [store (registered-store)
-           [output new-store] (execute-program program axioms store s)]
+           [output new-store] (execute-program program axioms store s publisher)]
        (update-store! new-store)
        {:headers json-headers
         :body output})
      {:status 404 :body (str "Program " uuid " not found")})))
 
-(defn exec-program [uuid program-text storage-config]
+(defn exec-program [uuid program-text storage-config publisher]
   (http-response
    (let [[program axioms] (if program-text
                            (parse-program program-text)
                            (let [{:keys [program axioms]} (get @programs uuid)]
                              [program axioms]))]
      (let [store (registered-store storage-config)
-           [output new-store] (execute-program program axioms store nil)]
+           [output new-store] (execute-program program axioms store nil publisher)]
        (when-not storage-config
          (update-store! new-store))
        {:headers json-headers
@@ -249,48 +252,57 @@
   (GET    "/store/data" [:as {params :params :as request}]
           (read-data params))
 
-  (POST "/store/test" [:as {raw :body}]
-        (test-post raw))
+  (POST   "/store/test" [:as {raw :body}]
+          (test-post raw))
 
-  (POST   "/rules" [:as {body :body}] (post-program body))
-  (DELETE "/rules" request (delete-programs))
-  (GET    "/rules/:uuid" [uuid] (get-program uuid))
-  (POST   "/rules/:uuid/eval" [uuid :as {body :body}] (exec-registered uuid body))
-  (POST   "/rules/:uuid/execute" [uuid :as {{:keys [program store]} :body-params}]
-          (exec-program uuid program store))
+  (POST   "/rules" [:as {body :body}]
+          (post-program body))
+  (DELETE "/rules" request
+          (delete-programs))
+  (GET    "/rules/:uuid" [uuid]
+          (get-program uuid))
+  (POST   "/rules/:uuid/eval" [uuid :as {:keys [body publisher]}]
+          (exec-registered uuid body publisher))
+  (POST   "/rules/:uuid/execute" [uuid :as {{:keys [program store]} :body-params pub :publisher}]
+          (exec-program uuid program store pub))
   (route/not-found "Not Found"))
-
-(def app
-  (-> app-routes
-      (wrap-restful-format :formats [:json-kw :edn])
-      (wrap-params)))
 
 (let [initialized? (promise)]
   (defn init
-    "Initialize the server for non-HTTP operations."
+    "Initialize the server for non-HTTP operations. Returns a Kafka publisher."
     []
     (when-not (realized? initialized?)
       (c/init!)
       (let [{{{graph :graph} :naga} :naga-http :as properties} @c/properties]
         (clojure.pprint/pprint @c/properties)
         (setup-storage! graph)
-        (kafka/init storage))
-      (deliver initialized? true))))
+        (let [publisher (kafka/init storage)]
+          (deliver initialized? true)
+          publisher)))))
 
-;; This is here so initialization happens with: lein ring server
-(init)
+(defn assoc-wrapper
+  "Middleware to assoc a value to a request"
+  [handler & [args]]
+  (fn [request]
+    (let [request' (apply assoc request args)]
+      (handler request'))))
 
 (defn start-server
   "Runs the routes on the provided port"
-  [port]
-  (jetty/run-jetty app {:port port}))
+  [port publisher]
+  (let [app (-> app-routes
+                (assoc-wrapper :publisher publisher)
+                (wrap-restful-format :formats [:json-kw :edn])
+                (wrap-params))]
+    (jetty/run-jetty app {:port port})))
 
 (defn -main
   "Entry point for the program"
   []
   (try
-    (init)
-    (start-server (get-in @c/properties [:naga-http :port] default-http-port))
+    (let [kafka-publisher (init)]
+      (start-server (get-in @c/properties [:naga-http :port] default-http-port)
+                    kafka-publisher))
     (catch BindException e
       (log/error "\nServer port already in use")
       (println "\nServer port already in use"))

@@ -11,7 +11,9 @@
                  [ring/ring-core "1.6.1"]
                  [ring/ring-defaults "0.3.0"]
                  [ring/ring-jetty-adapter "1.6.1"]
-                 [ring-middleware-format "0.7.2"]]
+                 [ring-middleware-format "0.7.2"]
+                 [clj-http "3.7.0"]
+                 [quoll/clients "0.1.2"]]
   :resource-paths ["resources"]
   :classpath ".:resources"
   :plugins [[lein-ring "0.9.7"]]

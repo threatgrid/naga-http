@@ -1,8 +1,9 @@
-(ns ^{:doc "Provides functionality for consuming Kafka events and storing
-            them in the registered graph"
+(ns ^{:doc "Provides functionality for consuming and producing Kafka events
+            and storing them in the registered graph"
       :author "Paula Gearon"}
   naga-http.kafka
   (:require [naga-http.configuration :as c]
+            [naga-http.publish :as p]
             [clojure.string :as str]
             [clojure.tools.logging :as log]
             [cheshire.core :as json]
@@ -10,6 +11,11 @@
             [franzy.clients.consumer.protocols :as protocols]
             [franzy.clients.consumer.defaults :as cd]
             [franzy.serialization.deserializers :as deserializers]
+            [franzy.clients.producer.protocols :as kafka]
+            [franzy.clients.producer.client :as producer]
+            [franzy.clients.producer.defaults :as pd]
+            [franzy.serialization.serializers :as serializers]
+            [clients.core :as client]
             [naga.data :as naga-data]
             [naga.store :as naga-store]))
 
@@ -17,12 +23,12 @@
 
 (def ^:const default-poll-timeout 100)
 
+(def production-key "updates")
+
 (defn get-servers
   []
   (let [{:keys [host port]} (get-in @c/properties [:naga-http :kafka])]
     (str host ":" port)))
-
-(def shutdown? (promise))
 
 (defn start-service
   [f]
@@ -51,27 +57,18 @@
       (catch Exception e
         (log/error "Error processing data from Kafka" e)))))
 
-(defn init
-  "Initialize the Kafka listener"
-  [storage]
-  (log/debug "Initializing Kafka")
-  (do-at-shutdown (deliver shutdown? true))
-  (let [{:keys [topic partition security truststore keystore password]}
-        (get-in @c/properties [:naga-http :kafka])
-
-        pc (cond-> {:bootstrap.servers (get-servers)
-                    :auto.offset.reset :latest}
-             security (assoc :security.protocol (str/upper-case security))
-             truststore (assoc :ssl.truststore.location truststore)
-             keystore (assoc :ssl.keystore.location keystore)
-             password (assoc :ssl.truststore.password password))
-        poll-timeout (get-in @c/properties [:naga-http :kafka :poll] default-poll-timeout)
+(defn start-listening-service
+  "Builds a listening service and starts it."
+  [storage config topic partition shutdown?]
+  (let [poll-timeout (get-in @c/properties [:naga-http :kafka :poll] default-poll-timeout)
         max-errors (get-in @c/properties [:naga-http :kafka :max-errors] default-max-errors)
         key-deserializer (deserializers/string-deserializer)
         value-deserializer (deserializers/string-deserializer)
         opts (cd/make-default-consumer-options)
-        topic-partitions [{:topic topic :partition 0}]
-        c (consumer/make-consumer pc key-deserializer value-deserializer opts)]
+        topic-partitions [{:topic topic :partition partition}]
+        c (consumer/make-consumer config key-deserializer value-deserializer opts)]
+
+    ;; create the listening service
     (try
       (protocols/assign-partitions! c topic-partitions)
       (protocols/seek-to-beginning-offset! c topic-partitions)
@@ -103,3 +100,42 @@
         (log/error "Error while setting up Kafka" e)
         (.close c)))))
 
+(defrecord KafkaPublisher [producer topic partition options]
+  p/Publisher
+  (publish [_ data]
+    (let [data-json (json/encode data)]
+      (log/info (str "Publishing JSON Delta to Kafka"))
+      (log/debug (str "Published JSON Delta to Kafka: " data-json))
+      (client/retry-exp
+       "send to Kafka"
+       (kafka/send-async! producer topic partition production-key data-json options)))))
+
+
+(defn init
+  "Initialize the Kafka listener"
+  [storage]
+
+  (log/debug "Initializing Kafka")
+
+  (let [{:keys [publish topic partition security truststore keystore password]}
+        (get-in @c/properties [:naga-http :kafka])
+
+        config (cond-> {:bootstrap.servers (get-servers)
+                        :auto.offset.reset :latest}
+                 security (assoc :security.protocol (str/upper-case security))
+                 truststore (assoc :ssl.truststore.location truststore)
+                 keystore (assoc :ssl.keystore.location keystore)
+                 password (assoc :ssl.truststore.password password))
+        shutdown? (promise)]
+
+    (do-at-shutdown (deliver shutdown? true))
+    (start-listening-service storage config topic partition shutdown?)
+
+    ;; return the publisher
+    (when publish
+      (log/info "Configuring Kafka publishing")
+      (let [options (pd/make-default-producer-options)
+            key-ser (serializers/string-serializer)
+            val-ser (serializers/string-serializer)
+            producer (producer/make-producer config key-ser val-ser options)]
+        (->KafkaPublisher producer topic partition options)))))
