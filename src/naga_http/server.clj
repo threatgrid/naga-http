@@ -3,6 +3,8 @@
     naga-http.server
   (:require [clojure.tools.logging :as log]
             [clojure.string :as s]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [cheshire.core :as json]
             [compojure.core :refer :all]
             [compojure.route :as route]
@@ -15,6 +17,7 @@
             [naga.store :as store]
             [naga-http.configuration :as c]
             [naga-http.kafka :as kafka]
+            [naga-http.publish :as p]
             [ring.adapter.jetty :as jetty]
             [ring.middleware.defaults :refer [wrap-defaults api-defaults]]
             [ring.middleware.params :refer [wrap-params]]
@@ -29,7 +32,7 @@
 
 (def default-max-threads 50)
 
-(def default-http-port 3000)
+(def default-http-port 3030)
 
 (def programs (atom {}))
 
@@ -38,6 +41,18 @@
 (def default-store {:type :memory :store default-graph})
 
 (def storage (atom default-store))
+
+(defn get-core-schema
+  "Retrieves the configured schema for storage, or an empty seq otherwise.
+   Throws an exception if a non-existent file is specified."
+  []
+  (when-let [{{{schema :schema} :naga} :naga-http :as properties} @c/properties]
+    (try
+      (if-let [r (io/resource schema)]
+        (slurp r)
+        (slurp schema))
+      (catch IllegalArgumentException e
+        (throw (ex-info "Unable to open schema file: " schema {:file schema}))))))
 
 (defmacro http-response
   [& body]
@@ -69,19 +84,24 @@
         :status 500
         :body (.getMessage e#)})))
 
+(defn init-storage!
+  [s g]
+  (let [schema (get-core-schema)
+        schemaed-g (if schema
+                     (store/assert-schema-opts g schema {:type :pairs})
+                     g)]
+    (reset! storage (assoc s :store schemaed-g))))
+
 (defn setup-storage! [stext]
   (when stext
     (let [st (json/parse-string stext true)
           handle (store/get-storage-handle st)]
-      (reset! storage (assoc st :store handle)))))
+      (init-storage! st handle))))
 
-(defn uuid-str []
-  (str (java.util.UUID/randomUUID)))
-
-(defn register-store! [s]
+(defn set-store! [s]
   (http-response
    (let [g (store/get-storage-handle s)]
-     (reset! storage (assoc s :store g))
+     (init-storage! s g)
      (:type s))))
 
 (defn reset-store! []
@@ -93,27 +113,37 @@
   (swap! storage assoc :store s)
   s)
 
-(defn registered-storage []
+(defn registered-storage
+  "Storage wraps a store with extra metadata"
+  []
   (or @storage default-store))
 
 (defn registered-store
+  "The connection to the implementation of the Graph protocol"
   ([] (registered-store nil))
   ([storage-config]
    (let [storage (or storage-config (registered-storage))]
      (or (:store storage)
          (store/get-storage-handle storage)))))
 
-(defn parse-program [text]
-  (let [{rules :rules} (pabu/read-str text)]
-    (r/create-program rules [])))
+(defn uuid-str []
+  (str (java.util.UUID/randomUUID)))
 
-(defn install-program! [s]
+(defn parse-program
+  [text]
+  (let [{:keys [rules axioms]} (pabu/read-str text)]
+    [(r/create-program rules []) axioms]))
+
+(defn install-program!
+  [s]
   (let [uuid (uuid-str)
-        text (slurp s)]
+        text (slurp s)
+        [program axioms] (parse-program text)]
     (swap! programs assoc uuid
            {:created (Date.)
             :text text
-            :program (parse-program text)})
+            :program program
+            :axioms axioms})
     uuid))
 
 (defn post-program [s]
@@ -138,10 +168,12 @@
 
 (defn add-schema
   [header schema raw-data]
-  (let [dtype (get-data-type header)
-        store (registered-store)]
-    (store/assert-schema-opts store (or schema (slurp raw-data)) {:type dtype})
-    "OK"))
+  (http-response
+   (let [dtype (get-data-type header)]
+     (-> (registered-store)
+         (store/assert-schema-opts (or schema (slurp raw-data)) {:type dtype})
+         update-store!)
+     "OK")))
 
 (defn add-data [data]
   (http-response
@@ -161,34 +193,43 @@
   (http-response
    (let [store (registered-store)]
      (if select
-       (store/query store select where)
+       (store/query store (edn/read-string select) (edn/read-string where))
        (if raw
          (store/retrieve-contents store)
          (data/store->json store))))))
 
-(defn execute-program [program store data]
+(defn execute-program [program axioms store data publisher]
   (when program
-    (let [triples-data (when data (data/stream->triples store data))
-          loaded-store (store/assert-data store triples-data)
-          config (assoc storage :store loaded-store)
-          [store stats] (e/run config program)
+    (let [initialized-store (if (seq axioms) (store/assert-data store axioms) store)
+          triples-data (when data (data/stream->triples initialized-store data))
+          loaded-store (if (seq triples-data)
+                         (store/assert-data initialized-store triples-data)
+                         initialized-store)
+          config (assoc @storage :store loaded-store)
+          [store stats delta-ids] (e/run config program)
+          deltas (map (partial data/id->json store) delta-ids)
           output (data/store->str store)]
+      (p/publish publisher deltas)
       [output store])))
 
-(defn exec-registered [uuid s]
+(defn exec-registered [uuid s publisher]
   (http-response
-   (when-let [program (get @programs uuid)]
+   (if-let [{:keys [program axioms]} (get @programs uuid)]
      (let [store (registered-store)
-           [output new-store] (execute-program program store s)]
+           [output new-store] (execute-program program axioms store s publisher)]
        (update-store! new-store)
        {:headers json-headers
-        :body output}))))
+        :body output})
+     {:status 404 :body (str "Program " uuid " not found")})))
 
-(defn exec-program [uuid program storage-config]
+(defn exec-program [uuid program-text storage-config publisher]
   (http-response
-   (when-let [program (or program (get @programs uuid))]
+   (let [[program axioms] (if program-text
+                           (parse-program program-text)
+                           (let [{:keys [program axioms]} (get @programs uuid)]
+                             [program axioms]))]
      (let [store (registered-store storage-config)
-           [output new-store] (execute-program program store nil)]
+           [output new-store] (execute-program program axioms store nil publisher)]
        (when-not storage-config
          (update-store! new-store))
        {:headers json-headers
@@ -201,57 +242,67 @@
     (clojure.pprint/pprint d)))
 
 (defroutes app-routes
-  (POST   "/store" [:as {dbconfig :body-params}] (register-store! dbconfig))
+  (POST   "/store" [:as {dbconfig :body-params}] (set-store! dbconfig))
   (DELETE "/store" request (reset-store!))
-  (POST "/store/test" [:as {raw :body}]
-        (test-post raw))
+
   (POST   "/store/schema" [:as {headers :headers schema :body-params raw-data :body}]
           (add-schema headers schema raw-data))
-  (GET    "/store/data" [:as {params :params :as request}]
-          ;; TODO get header params
-          (read-data params))
-  (POST   "/store/data" [:as {data :body-params}] (add-data data))
-  (POST   "/rules" [:as {body :body}] (post-program body))
-  (DELETE "/rules" request (delete-programs))
-  (GET    "/rules/:uuid" [uuid] (get-program uuid))
-  (POST   "/rules/:uuid/eval" [uuid :as {body :body}] (exec-registered uuid body))
-  (POST   "/rules/:uuid/execute" [uuid :as {{:keys [program store]} :body-params}]
-          (exec-program uuid program store))
-  (route/not-found "Not Found"))
 
-(def app
-  (-> app-routes
-      (wrap-restful-format :formats [:json-kw :edn])
-      (wrap-params)))
+  (POST   "/store/data" [:as {data :body-params}] (add-data data))
+  (GET    "/store/data" [:as {params :params :as request}]
+          (read-data params))
+
+  (POST   "/store/test" [:as {raw :body}]
+          (test-post raw))
+
+  (POST   "/rules" [:as {body :body}]
+          (post-program body))
+  (DELETE "/rules" request
+          (delete-programs))
+  (GET    "/rules/:uuid" [uuid]
+          (get-program uuid))
+  (POST   "/rules/:uuid/eval" [uuid :as {:keys [body publisher]}]
+          (exec-registered uuid body publisher))
+  (POST   "/rules/:uuid/execute" [uuid :as {{:keys [program store]} :body-params pub :publisher}]
+          (exec-program uuid program store pub))
+  (route/not-found "Not Found"))
 
 (let [initialized? (promise)]
   (defn init
-    "Initialize the server for non-HTTP operations."
+    "Initialize the server for non-HTTP operations. Returns a Kafka publisher."
     []
     (when-not (realized? initialized?)
       (c/init!)
-      (let [{{{graph :graph} :naga
-              {topic :topic} :kafka} :naga-http :as properties} @c/properties]
+      (let [{{{graph :graph} :naga} :naga-http :as properties} @c/properties]
         (clojure.pprint/pprint @c/properties)
         (setup-storage! graph)
-        (kafka/init topic)
-        (kafka/register-storage storage))
-      (deliver initialized? true))))
+        (let [publisher (kafka/init storage)]
+          (deliver initialized? true)
+          publisher)))))
 
-;; This is here so initialization happens with: lein ring server
-(init)
+(defn assoc-wrapper
+  "Middleware to assoc a value to a request"
+  [handler & [args]]
+  (fn [request]
+    (let [request' (apply assoc request args)]
+      (handler request'))))
 
 (defn start-server
   "Runs the routes on the provided port"
-  [port]
-  (jetty/run-jetty app {:port port}))
+  [port publisher]
+  (let [app (-> app-routes
+                (assoc-wrapper :publisher publisher)
+                (wrap-restful-format :formats [:json-kw :edn])
+                (wrap-params))]
+    (jetty/run-jetty app {:port port})))
 
 (defn -main
   "Entry point for the program"
   []
   (try
-    (init)
-    (start-server (get-in @c/properties [:naga-http :port] default-http-port))
+    (let [kafka-publisher (init)]
+      (start-server (get-in @c/properties [:naga-http :port] default-http-port)
+                    kafka-publisher))
     (catch BindException e
       (log/error "\nServer port already in use")
       (println "\nServer port already in use"))
